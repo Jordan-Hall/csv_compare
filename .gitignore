@@ -1,0 +1,11 @@
+# Dependencies
+node_modules/
+
+# Generated reports and example outputs
+examples/
+reports/
+
+# Logs and OS noise
+*.log
+.DS_Store
+Thumbs.db

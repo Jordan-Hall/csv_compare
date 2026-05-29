@@ -1,0 +1,22 @@
+{
+  "name": "csv-compare",
+  "version": "0.1.0",
+  "description": "A Bun CLI for comparing CSV files by ID or another key field.",
+  "type": "module",
+  "bin": {
+    "csv-compare": "./src/index.ts"
+  },
+  "scripts": {
+    "compare": "bun run src/index.ts",
+    "check": "bun run src/index.ts --help",
+    "profile": "bun run src/index.ts examples/source.csv --out examples/profile-report.md --format markdown",
+    "sample": "bun run src/index.ts examples/source.csv examples/source.csv --key ID --out examples/report.md --format markdown",
+    "sample:diff": "bun run src/index.ts examples/source.csv examples/target.csv --key ID --out examples/diff-report.md --format markdown",
+    "sample:unknown": "bun run src/index.ts examples/unknown-source.csv examples/unknown-target.csv --key \"External Ref\" --out examples/unknown-report.md --format markdown",
+    "sample:html": "bun run src/index.ts examples/source.csv examples/target.csv --key ID --out examples/report.html --format html"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.9.3"
+  }
+}
