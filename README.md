@@ -58,6 +58,7 @@ bun run compare -- <source.csv> <target.csv> --key CustomerId --out report.md
     --group-depth <n>      Build grouped slices up to this many context fields. Default: 3, max: 5
     --violation-min-support <n> Min source rows backing a value rule before a target break is flagged. Default: 2. Use 1 to flag every broken relationship.
     --dedupe-rules         Collapse reverse-direction value rules (A=x => B=y vs B=y => A=x) to the stronger one.
+    --no-progress          Hide the live progress bar (percent + ETA) shown on stderr while generating the report.
     --ollama               Add an optional local Ollama narrative section for compare mode.
     --ollama-model <name>  Ollama model to use. Default: llama3.2
     --ollama-url <url>     Ollama base URL. Default: http://localhost:11434
@@ -67,6 +68,8 @@ bun run compare -- <source.csv> <target.csv> --key CustomerId --out report.md
 -h, --help                 Show help.
 -v, --version              Show the version.
 ```
+
+While the report is generated, a live progress bar with percent complete, the current phase, and a rough ETA is shown on stderr (so piped report output on stdout stays clean). It updates in place in an interactive terminal and prints one line per phase when output is redirected. Disable it with `--no-progress`.
 
 Single-file profile mode exits with code `0` when the profile report is written. Two-file compare mode exits with code `0` when the files match and `1` when differences are found.
 

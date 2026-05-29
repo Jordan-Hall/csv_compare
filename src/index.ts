@@ -2,7 +2,7 @@
 import { mkdir } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { parseCsv } from "./csv";
-import { buildCompareReport, buildCsvProfileReport, defaultGroupDepth, defaultViolationMinSupport, maxGroupDepth } from "./compare";
+import { buildCompareReport, buildCsvProfileReport, defaultGroupDepth, defaultViolationMinSupport, maxGroupDepth, type ProgressReporter } from "./compare";
 import { buildLocalAiNarrative, type AiApi } from "./ollama";
 import { renderReport, type ReportFormat } from "./report";
 
@@ -19,6 +19,7 @@ interface CliOptions {
   groupDepth: number;
   violationMinSupport: number;
   dedupeRules: boolean;
+  progress: boolean;
   useOllama: boolean;
   ollamaModel: string;
   ollamaUrl: string;
@@ -44,6 +45,7 @@ async function main(): Promise<void> {
 
   const sourceText = await Bun.file(options.sourcePath).text();
   const source = parseCsv(sourceText, { trimValues: options.trimValues });
+  const progress = createProgressReporter(options.progress);
 
   const report = options.targetPath === undefined
     ? buildCsvProfileReport({
@@ -55,6 +57,7 @@ async function main(): Promise<void> {
         groupDepth: options.groupDepth,
         dedupeRules: options.dedupeRules,
       },
+      onProgress: progress.report,
     })
     : buildCompareReport({
       sourcePath: options.sourcePath,
@@ -69,7 +72,9 @@ async function main(): Promise<void> {
         violationMinSupport: options.violationMinSupport,
         dedupeRules: options.dedupeRules,
       },
+      onProgress: progress.report,
     });
+  progress.finish();
 
   if (!("mode" in report) && options.useOllama) {
     report.analysis.localAi = await buildLocalAiNarrative(report, {
@@ -95,6 +100,56 @@ async function main(): Promise<void> {
   process.exitCode = "mode" in report ? 0 : report.passed ? 0 : 1;
 }
 
+function createProgressReporter(enabled: boolean): { report: ProgressReporter; finish: () => void } {
+  if (!enabled) {
+    return { report: () => {}, finish: () => {} };
+  }
+
+  const isTty = process.stderr.isTTY === true;
+  const start = Date.now();
+  let lastPercent = -1;
+
+  const report: ProgressReporter = (fraction, phase) => {
+    const percent = Math.round(fraction * 100);
+    const elapsed = (Date.now() - start) / 1000;
+    const eta = fraction > 0 ? (elapsed * (1 - fraction)) / fraction : 0;
+
+    if (isTty) {
+      const width = 24;
+      const filled = Math.max(0, Math.min(width, Math.round(fraction * width)));
+      const bar = "█".repeat(filled) + "░".repeat(width - filled);
+      process.stderr.write(`\r  [${bar}] ${String(percent).padStart(3)}%  ${phase.padEnd(20).slice(0, 20)}  ETA ${formatDuration(eta)}    `);
+    } else if (percent !== lastPercent) {
+      process.stderr.write(`  ${String(percent).padStart(3)}%  ${phase} (ETA ${formatDuration(eta)})\n`);
+      lastPercent = percent;
+    }
+  };
+
+  const finish = (): void => {
+    if (isTty) {
+      // Clear the in-place bar so the "Report written" line starts clean.
+      process.stderr.write(`\r${" ".repeat(72)}\r`);
+    }
+  };
+
+  return { report, finish };
+}
+
+function formatDuration(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds <= 0) {
+    return "0s";
+  }
+  if (seconds < 1) {
+    return "<1s";
+  }
+  if (seconds < 60) {
+    return `${Math.ceil(seconds)}s`;
+  }
+  const minutes = Math.floor(seconds / 60);
+  const remainder = Math.ceil(seconds % 60);
+  return `${minutes}m${String(remainder).padStart(2, "0")}s`;
+}
+
 function parseArgs(args: string[]): CliOptions | "help" | "version" {
   if (args.includes("--help") || args.includes("-h")) {
     return "help";
@@ -116,6 +171,7 @@ function parseArgs(args: string[]): CliOptions | "help" | "version" {
     groupDepth: defaultGroupDepth(),
     violationMinSupport: defaultViolationMinSupport(),
     dedupeRules: false,
+    progress: true,
     useOllama: false,
     ollamaModel: "llama3.2",
     ollamaUrl: "http://localhost:11434",
@@ -191,6 +247,11 @@ function parseArgs(args: string[]): CliOptions | "help" | "version" {
 
     if (arg === "--dedupe-rules") {
       options.dedupeRules = true;
+      continue;
+    }
+
+    if (arg === "--no-progress") {
+      options.progress = false;
       continue;
     }
 
@@ -307,6 +368,7 @@ Options:
       --group-depth <n>      Build grouped slices up to this many context fields. Default: ${defaultGroupDepth()}, max: ${maxGroupDepth()}
       --violation-min-support <n> Min source rows backing a rule before a target break is flagged. Default: ${defaultViolationMinSupport()}. Use 1 to flag every broken relationship.
       --dedupe-rules         Collapse reverse-direction value rules (A=x => B=y vs B=y => A=x) to the stronger one.
+      --no-progress          Hide the live progress bar (percent + ETA) shown on stderr while generating the report.
       --ollama               Add an optional AI narrative section for compare mode.
       --ollama-model <name>  Model to use. Default: llama3.2
       --ollama-url <url>     Base URL or full endpoint. Default: http://localhost:11434

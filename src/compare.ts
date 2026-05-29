@@ -296,18 +296,46 @@ export interface CsvProfileReport {
   analysis: CsvProfileAnalysis;
 }
 
+// Reports progress as a 0..1 fraction with a label for the phase just completed.
+export type ProgressReporter = (fraction: number, phase: string) => void;
+type ProgressAdvance = (weight: number, phase: string) => void;
+
 interface BuildReportInput {
   sourcePath: string;
   targetPath: string;
   source: ParsedCsv;
   target: ParsedCsv;
   options: CompareOptions;
+  onProgress?: ProgressReporter;
 }
 
 const DEFAULT_GROUP_DEPTH = 3;
 const MAX_GROUP_DEPTH = 5;
 const GROUPING_CONTEXT_LIMIT = 8;
 const DEFAULT_VIOLATION_MIN_SUPPORT = 2;
+
+// Relative cost of each generation phase, used to weight the progress fraction.
+// Value-rule mining and field inference dominate on wide files, so they weigh more.
+const PROGRESS_WEIGHT = {
+  index: 1,
+  columns: 1,
+  cells: 2,
+  inferFields: 2,
+  grouping: 2,
+  analytics: 1,
+  valueDeps: 2,
+  intelligence: 1,
+} as const;
+
+function createAdvance(total: number, report: ProgressReporter | undefined): ProgressAdvance {
+  let done = 0;
+  return (weight, phase) => {
+    done += weight;
+    if (report !== undefined) {
+      report(total <= 0 ? 1 : Math.min(1, done / total), phase);
+    }
+  };
+}
 
 export function defaultGroupDepth(): number {
   return DEFAULT_GROUP_DEPTH;
@@ -339,6 +367,17 @@ export function buildCompareReport(input: BuildReportInput): CompareReport {
     throw new Error(`Target CSV does not contain key field "${keyField}".`);
   }
 
+  const totalWeight =
+    PROGRESS_WEIGHT.index +
+    PROGRESS_WEIGHT.columns +
+    (options.compareValues ? PROGRESS_WEIGHT.cells : 0) +
+    PROGRESS_WEIGHT.inferFields +
+    PROGRESS_WEIGHT.grouping +
+    PROGRESS_WEIGHT.analytics +
+    PROGRESS_WEIGHT.valueDeps +
+    PROGRESS_WEIGHT.intelligence;
+  const advance = createAdvance(totalWeight, input.onProgress);
+
   const sourceIndex = indexRowsByKey(source.rows, keyField);
   const targetIndex = indexRowsByKey(target.rows, keyField);
   const sourceKeys = [...sourceIndex.uniqueRows.keys()].sort(compareKeys);
@@ -351,14 +390,19 @@ export function buildCompareReport(input: BuildReportInput): CompareReport {
   const allColumns = unique([...source.headers, ...target.headers]).sort();
   const sourceOnlyColumns = source.headers.filter((header) => !target.headers.includes(header)).sort();
   const targetOnlyColumns = target.headers.filter((header) => !source.headers.includes(header)).sort();
+  advance(PROGRESS_WEIGHT.index, "Indexing keys");
 
   const columnStats = allColumns.map((column) =>
     buildColumnStats(column, source, target),
   );
+  advance(PROGRESS_WEIGHT.columns, "Comparing columns");
 
   const cellDifferences = options.compareValues
     ? buildCellDifferences(matchedKeys, sourceIndex.uniqueRows, targetIndex.uniqueRows, source.headers, target.headers, keyField)
     : [];
+  if (options.compareValues) {
+    advance(PROGRESS_WEIGHT.cells, "Comparing cell values");
+  }
   const analysisWithoutIntelligence = buildDetailedAnalysis({
     keyField,
     requestedContextFields: options.contextFields,
@@ -374,6 +418,7 @@ export function buildCompareReport(input: BuildReportInput): CompareReport {
     extraInTarget,
     cellDifferences,
     columnStats,
+    onAdvance: advance,
   });
 
   const passed =
@@ -404,6 +449,7 @@ export function buildCompareReport(input: BuildReportInput): CompareReport {
       analysis: analysisWithoutIntelligence,
     }),
   };
+  advance(PROGRESS_WEIGHT.intelligence, "Scoring intelligence");
 
   return {
     sourcePath: input.sourcePath,
@@ -430,9 +476,17 @@ interface BuildProfileInput {
   sourcePath: string;
   source: ParsedCsv;
   options: Pick<CompareOptions, "keyField" | "contextFields" | "groupDepth" | "dedupeRules">;
+  onProgress?: ProgressReporter;
 }
 
 export function buildCsvProfileReport(input: BuildProfileInput): CsvProfileReport {
+  const totalWeight =
+    PROGRESS_WEIGHT.inferFields +
+    PROGRESS_WEIGHT.grouping +
+    PROGRESS_WEIGHT.columns +
+    PROGRESS_WEIGHT.valueDeps;
+  const advance = createAdvance(totalWeight, input.onProgress);
+
   const provisionalFields = input.source.headers.map((column) =>
     inferField(column, "", input.source.rows, input.source.rows),
   );
@@ -440,6 +494,7 @@ export function buildCsvProfileReport(input: BuildProfileInput): CsvProfileRepor
   const inferredFields = input.source.headers.map((column) =>
     inferField(column, keyField, input.source.rows, input.source.rows),
   );
+  advance(PROGRESS_WEIGHT.inferFields, "Inferring field roles");
   const contextColumns = chooseContextColumns(keyField, inferredFields, input.options.contextFields);
   const groupingColumns = contextColumns.filter((column) => column !== keyField);
   const groupDepth = normalizeGroupDepth(input.options.groupDepth);
@@ -450,11 +505,15 @@ export function buildCsvProfileReport(input: BuildProfileInput): CsvProfileRepor
   );
   const profileRows = buildProfileRows(input.source.rows, keyField, contextColumns);
   const rowGroups = buildGroups("row_group", profileRows, groupingColumns, timestampColumns, groupDepth);
+  advance(PROGRESS_WEIGHT.grouping, "Grouping rows");
   const columnStats = input.source.headers.map((column) =>
     buildColumnStats(column, input.source, input.source),
   );
   const columnFamilies = buildColumnFamilies(input.source.headers, inferredFields);
   const ruleColumns = ruleEligibleColumns(input.source.headers, inferredFields, keyField);
+  advance(PROGRESS_WEIGHT.columns, "Profiling columns");
+  const valueDependencyRules = maybeDedupeRules(buildValueDependencyRules(input.source.rows, ruleColumns), input.options.dedupeRules);
+  advance(PROGRESS_WEIGHT.valueDeps, "Mining value rules");
 
   return {
     mode: "profile",
@@ -474,7 +533,7 @@ export function buildCsvProfileReport(input: BuildProfileInput): CsvProfileRepor
       columnFamilies,
       valueDependencies: {
         eligibleColumns: ruleColumns,
-        rules: maybeDedupeRules(buildValueDependencyRules(input.source.rows, ruleColumns), input.options.dedupeRules),
+        rules: valueDependencyRules,
         violations: [],
       },
       profile: buildCsvProfileSummary(input.source, inferredFields),
@@ -644,12 +703,14 @@ interface DetailedAnalysisInput {
   extraInTarget: string[];
   cellDifferences: CellDifference[];
   columnStats: ColumnStats[];
+  onAdvance?: ProgressAdvance;
 }
 
 function buildDetailedAnalysis(input: DetailedAnalysisInput): DetailedAnalysisWithoutIntelligence {
   const inferredFields = input.allColumns.map((column) =>
     inferField(column, input.keyField, input.source.rows, input.target.rows),
   );
+  input.onAdvance?.(PROGRESS_WEIGHT.inferFields, "Inferring field roles");
   const contextColumns = chooseContextColumns(input.keyField, inferredFields, input.requestedContextFields);
   const groupingColumns = contextColumns.filter((column) => column !== input.keyField);
   const groupDepth = normalizeGroupDepth(input.groupDepth);
@@ -679,6 +740,7 @@ function buildDetailedAnalysis(input: DetailedAnalysisInput): DetailedAnalysisWi
   const changedColumns = buildChangedColumnSummaries(enrichedCellDifferences);
   const linkColumns = buildLinkColumnSummaries(input.columnStats, inferredFields);
   const columnFamilies = buildColumnFamilies(input.allColumns, inferredFields);
+  input.onAdvance?.(PROGRESS_WEIGHT.grouping, "Grouping rows");
 
   return {
     inferredFields,
@@ -704,6 +766,7 @@ function buildDetailedAnalysis(input: DetailedAnalysisInput): DetailedAnalysisWi
       linkColumns,
       columnStats: input.columnStats,
       cellDifferences: enrichedCellDifferences,
+      onAdvance: input.onAdvance,
     }),
   };
 }
@@ -723,27 +786,35 @@ interface AnalyticsInput {
   linkColumns: LinkColumnSummary[];
   columnStats: ColumnStats[];
   cellDifferences: CellDifference[];
+  onAdvance?: ProgressAdvance;
 }
 
 function buildAnalyticsLayer(input: AnalyticsInput): AnalyticsLayer {
-  return {
+  const layer = {
     dataProfile: buildDataProfile(input),
     issueLayers: buildIssueLayers(input),
     groupInsights: buildGroupInsights(input.problemGroups, input.missingRows.length, input.extraRows.length, input.cellDifferences.length),
     nearMatches: buildNearMatches(input.missingRows, input.extraRows, input.keyField),
     columnImpact: buildColumnImpact(input.columnStats, input.changedColumns, input.inferredFields),
     relationshipInsights: buildRelationshipInsights(input.linkColumns, input.inferredFields),
-    valueDependencies: buildValueDependencyLayer({
-      keyField: input.keyField,
-      violationMinSupport: input.violationMinSupport,
-      dedupeRules: input.dedupeRules,
-      sourceHeaders: input.source.headers,
-      targetHeaders: input.target.headers,
-      allColumns: input.allColumns,
-      inferredFields: input.inferredFields,
-      sourceRows: input.source.rows,
-      targetRows: input.target.rows,
-    }),
+  };
+  input.onAdvance?.(PROGRESS_WEIGHT.analytics, "Scoring analytics");
+
+  const valueDependencies = buildValueDependencyLayer({
+    keyField: input.keyField,
+    violationMinSupport: input.violationMinSupport,
+    dedupeRules: input.dedupeRules,
+    sourceHeaders: input.source.headers,
+    targetHeaders: input.target.headers,
+    allColumns: input.allColumns,
+    inferredFields: input.inferredFields,
+    sourceRows: input.source.rows,
+    targetRows: input.target.rows,
+  });
+  input.onAdvance?.(PROGRESS_WEIGHT.valueDeps, "Mining value rules");
+  return {
+    ...layer,
+    valueDependencies,
   };
 }
 
